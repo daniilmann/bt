@@ -1489,6 +1489,8 @@ class Rebalance(Algo):
         for item in iteritems(targets):
             target.rebalance(item[1], child=item[0], base=base)
 
+        target.perm['position'] = np.any(target.positions.iloc[-1] != 0)
+
         return True
 
 
@@ -1637,4 +1639,3 @@ class Or(Algo):
             res = res | tempRes
 
         return res
-

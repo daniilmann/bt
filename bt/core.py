@@ -9,6 +9,9 @@ import pandas as pd
 import numpy as np
 import cython as cy
 
+from scipy.optimize import root
+from functools import partial
+
 
 class Node(object):
 
@@ -299,7 +302,7 @@ class StrategyBase(Node):
     _paper_trade = cy.declare(cy.bint)
     bankrupt = cy.declare(cy.bint)
 
-    def __init__(self, name, children=None, parent=None):
+    def __init__(self, name, children=None, parent=None, sec_amount_rounding=None):
         Node.__init__(self, name, children=children, parent=parent)
         self._capital = 0
         self._weight = 1
@@ -318,6 +321,12 @@ class StrategyBase(Node):
         self._paper_trade = False
         self._positions = None
         self.bankrupt = False
+
+        self._sec_qround = sec_amount_rounding
+
+    @property
+    def assets(self):
+        return self._universe.columns
 
     @property
     def price(self):
@@ -415,6 +424,11 @@ class StrategyBase(Node):
         self._positions = vals
         return vals
 
+    @property
+    def current_position(self):
+    	return {x.name: x.positions.iloc[-1] for x in self.members
+                             if isinstance(x, SecurityBase)}
+     
     def setup(self, universe):
         """
         Setup strategy with universe. This will speed up future calculations
@@ -479,6 +493,9 @@ class StrategyBase(Node):
         # pollute with potential strategy children in funiverse
         if self.children is not None:
             [c.setup(universe) for c in self._childrenv]
+
+        if self._sec_qround is None:
+            self._sec_qround = dict()
 
     @cy.locals(newpt=cy.bint, val=cy.double, ret=cy.double)
     def update(self, date, data=None, inow=None):
@@ -639,7 +656,10 @@ class StrategyBase(Node):
         # allocate to child
         if child is not None:
             if child not in self.children:
-                c = SecurityBase(child)
+                rounding = None
+                if isinstance(self._sec_qround, dict):
+                    rounding = self._sec_qround.get(child, None)
+                c = SecurityBase(child, amount_rounding=rounding)
                 c.setup(self._universe)
                 # update to bring up to speed
                 c.update(self.now)
@@ -709,7 +729,10 @@ class StrategyBase(Node):
 
         # else make sure we have child
         if child not in self.children:
-            c = SecurityBase(child)
+            rounding = None
+            if isinstance(self._sec_qround, dict):
+                rounding = self._sec_qround.get(child, None)
+            c = SecurityBase(child, amount_rounding=rounding)
             c.setup(self._universe)
             # update child to bring up to speed
             c.update(self.now)
@@ -718,7 +741,7 @@ class StrategyBase(Node):
         # allocate to child
         # figure out weight delta
         c = self.children[child]
-        delta = weight - c.weight
+        delta = np.round(weight - c.weight, 4)
         c.allocate(delta * base)
 
     def close(self, child):
@@ -813,13 +836,14 @@ class SecurityBase(Node):
     _outlay = cy.declare(cy.double)
 
     @cy.locals(multiplier=cy.double)
-    def __init__(self, name, multiplier=1):
+    def __init__(self, name, multiplier=1, amount_rounding=None):
         Node.__init__(self, name, parent=None, children=None)
         self._value = 0
         self._price = 0
         self._weight = 0
         self._position = 0
         self.multiplier = multiplier
+        self._qround = 5 if amount_rounding is None else amount_rounding
 
         # opt
         self._last_pos = 0
@@ -982,6 +1006,9 @@ class SecurityBase(Node):
             # reset outlay back to 0
             self._outlay = 0
 
+    def root_q(self, q, amount, outlay_fn):
+        return amount - outlay_fn(q)[0]
+
     @cy.locals(amount=cy.double, update=cy.bint, q=cy.double, outlay=cy.double,
                i=cy.int)
     def allocate(self, amount, update=True):
@@ -1032,7 +1059,9 @@ class SecurityBase(Node):
         if amount == -self._value:
             q = -self._position
         else:
-            q = amount / (self._price * self.multiplier)
+            partial_root_q = partial(self.root_q, amount=amount, outlay_fn=self.outlay)
+            q = root(partial_root_q, amount / self._price, tol=1./self._qround).x[0]
+            # q = amount / (self._price * self.multiplier)
             if self.integer_positions:
                 if (self._position > 0) or ((self._position == 0) and (
                         amount > 0)):
@@ -1041,6 +1070,9 @@ class SecurityBase(Node):
                 else:
                     # if we're going short or changing short position
                     q = math.ceil(q)
+            else:
+                round_mult = float(np.power(10, self._qround))
+                q = np.round(int(q * round_mult) / round_mult, self._qround)
 
         # if q is 0 nothing to do
         if q == 0 or np.isnan(q):
@@ -1059,8 +1091,8 @@ class SecurityBase(Node):
         # sell additional units to fund this requirement. As such, q must once
         # again decrease.
         #
-        if not q == -self._position:
-            full_outlay, _, _ = self.outlay(q)
+        # if not q == -self._position:
+        #     full_outlay, _, _ = self.outlay(q)
 
             # if full outlay > amount, we must decrease the magnitude of `q`
             # this can potentially lead to an infinite loop if the commission
@@ -1075,61 +1107,61 @@ class SecurityBase(Node):
             # if integer positions is false then we want full_outlay == amount
             # if integer positions is true then we want to be at the q where
             #   if we bought 1 more then we wouldn't have enough cash
-            i = 0
-            last_q = q
-            last_amount_short = full_outlay - amount
-            while not np.isclose(full_outlay, amount, rtol=0.) and q != 0:
+            # i = 0
+            # last_q = q
+            # last_amount_short = full_outlay - amount
+            # while not math.isclose(full_outlay, amount, rel_tol=0.0, abs_tol=0.0) and q != 0:
 
-                dq_wout_considering_tx_costs = (full_outlay - amount)/(self._price * self.multiplier)
-                q = q - dq_wout_considering_tx_costs
+            #     dq_wout_considering_tx_costs = (full_outlay - amount)/(self._price * self.multiplier)
+            #     q = q - dq_wout_considering_tx_costs
 
-                if self.integer_positions:
-                    q = math.floor(q)
+            #     if self.integer_positions:
+            #         q = math.floor(q)
 
-                full_outlay, _, _ = self.outlay(q)
+            #     full_outlay, _, _ = self.outlay(q)
 
-                # if our q is too low and we have integer positions
-                # then we know that the correct quantity is the one  where
-                # the outlay of q + 1 < amount. i.e. if we bought one more
-                # position then we wouldn't have enough cash
-                if self.integer_positions:
+            #     # if our q is too low and we have integer positions
+            #     # then we know that the correct quantity is the one  where
+            #     # the outlay of q + 1 < amount. i.e. if we bought one more
+            #     # position then we wouldn't have enough cash
+            #     if self.integer_positions:
 
-                    full_outlay_of_1_more, _, _ = self.outlay(q + 1)
+            #         full_outlay_of_1_more, _, _ = self.outlay(q + 1)
 
-                    if full_outlay < amount and full_outlay_of_1_more > amount:
-                        break
+            #         if full_outlay < amount and full_outlay_of_1_more > amount:
+            #             break
 
-                # if not integer positions then we should keep going until
-                # full_outlay == amount or is close enough
+            #     # if not integer positions then we should keep going until
+            #     # full_outlay == amount or is close enough
 
-                i = i + 1
-                if i > 1e4:
-                    raise Exception(
-                        'Potentially infinite loop detected. This occurred '
-                        'while trying to reduce the amount of shares purchased'
-                        ' to respect the outlay <= amount rule. This is most '
-                        'likely due to a commission function that outputs a '
-                        'commission that is greater than the amount of cash '
-                        'a short sale can raise.')
+            #     i = i + 1
+            #     if i > 1e4:
+            #         raise Exception(
+            #             'Potentially infinite loop detected. This occurred '
+            #             'while trying to reduce the amount of shares purchased'
+            #             ' to respect the outlay <= amount rule. This is most '
+            #             'likely due to a commission function that outputs a '
+            #             'commission that is greater than the amount of cash '
+            #             'a short sale can raise.')
 
-                if self.integer_positions and last_q == q:
-                    raise Exception(
-                        'Newton Method like root search for quantity is stuck!'
-                        ' q did not change in iterations so it is probably a bug'
-                        ' but we are not entirely sure it is wrong! Consider '
-                        ' changing to warning.'
-                    )
-                last_q = q
+            #     if self.integer_positions and last_q == q:
+            #         raise Exception(
+            #             'Newton Method like root search for quantity is stuck!'
+            #             ' q did not change in iterations so it is probably a bug'
+            #             ' but we are not entirely sure it is wrong! Consider '
+            #             ' changing to warning.'
+            #         )
+            #     last_q = q
 
-                if np.abs(full_outlay - amount) > np.abs(last_amount_short):
-                    raise Exception(
-                        'The difference between what we have raised with q and'
-                        ' the amount we are trying to raise has gotten bigger since'
-                        ' last iteration! full_outlay should always be approaching'
-                        ' amount! There may be a case where the commission fn is'
-                        ' not smooth'
-                    )
-                last_amount_short = full_outlay - amount
+            #     if np.abs(full_outlay - amount) > np.abs(last_amount_short):
+            #         raise Exception(
+            #             'The difference between what we have raised with q and'
+            #             ' the amount we are trying to raise has gotten bigger since'
+            #             ' last iteration! full_outlay should always be approaching'
+            #             ' amount! There may be a case where the commission fn is'
+            #             ' not smooth'
+            #         )
+            #     last_amount_short = full_outlay - amount
 
         # if last step led to q == 0, then we can return just like above
         if q == 0:
@@ -1294,8 +1326,8 @@ class Strategy(StrategyBase):
 
     """
 
-    def __init__(self, name, algos=None, children=None):
-        super(Strategy, self).__init__(name, children=children)
+    def __init__(self, name, algos=None, children=None, sec_amount_rounding=None):
+        super(Strategy, self).__init__(name, children=children, sec_amount_rounding=sec_amount_rounding)
         if algos is None:
             algos = []
         self.stack = AlgoStack(*algos)
